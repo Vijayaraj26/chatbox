@@ -5,7 +5,7 @@ st.set_page_config(page_title="My Free AI Chatbot", page_icon="🤖")
 st.title("🤖 My Free AI Chatbot")
 
 # Get API key from Streamlit secrets
-api_key = st.secrets["OPENROUTER_API_KEY"]
+api_key = st.secrets["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"]
 
 # Chat history
 if "messages" not in st.session_state:
