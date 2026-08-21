@@ -1,8 +1,15 @@
 import streamlit as st
-import requests
+import google.generativeai as genai
 
-st.set_page_config(page_title="Free Chatbot", page_icon="🤖")
-st.title("🤖 Free Chatbot (No API Key)")
+st.set_page_config(page_title="Gemini Chatbot", page_icon="🤖")
+st.title("🤖 Free Gemini Chatbot")
+
+try:
+    genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
+    model = genai.GenerativeModel('gemini-pro')
+except:
+    st.error("❌ Add GEMINI_API_KEY in Secrets!")
+    st.stop()
 
 if "messages" not in st.session_state:
     st.session_state.messages = []
@@ -19,15 +26,8 @@ if prompt := st.chat_input("Type your message..."):
     with st.chat_message("assistant"):
         with st.spinner("Thinking..."):
             try:
-                response = requests.post(
-                    "https://api-inference.huggingface.co/models/microsoft/DialoGPT-medium",
-                    json={"inputs": prompt}
-                )
-                if response.status_code == 200:
-                    bot_reply = response.json().get("generated_text", "Hello!")
-                    st.write(bot_reply)
-                    st.session_state.messages.append({"role": "assistant", "content": bot_reply})
-                else:
-                    st.write("Try again!")
-            except:
-                st.write("Error connecting!")
+                response = model.generate_content(prompt)
+                st.write(response.text)
+                st.session_state.messages.append({"role": "assistant", "content": response.text})
+            except Exception as e:
+                st.error(f"Error: {str(e)}")
