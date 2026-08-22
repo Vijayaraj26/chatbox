@@ -1,10 +1,10 @@
 import os
-import uuid
 from datetime import datetime, timezone
 
 import streamlit as st
 from google import genai
 from pymongo import MongoClient
+from bson import ObjectId
 
 
 # ============================================================
@@ -12,14 +12,14 @@ from pymongo import MongoClient
 # ============================================================
 
 st.set_page_config(
-    page_title="Gemini AI Chatbot",
+    page_title="AI Chatbot",
     page_icon="🤖",
     layout="wide"
 )
 
 
 # ============================================================
-# GET ENVIRONMENT VARIABLES
+# ENVIRONMENT VARIABLES
 # ============================================================
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
@@ -31,22 +31,11 @@ MONGO_URI = os.getenv("MONGO_URI")
 # ============================================================
 
 if not GEMINI_API_KEY:
-    st.error("❌ GEMINI_API_KEY is not configured in Render.")
-
-    st.info(
-        "Go to Render → Environment → Add GEMINI_API_KEY"
-    )
-
+    st.error("❌ GEMINI_API_KEY is not set.")
     st.stop()
 
-
 if not MONGO_URI:
-    st.error("❌ MONGO_URI is not configured in Render.")
-
-    st.info(
-        "Go to Render → Environment → Add MONGO_URI"
-    )
-
+    st.error("❌ MONGO_URI is not set.")
     st.stop()
 
 
@@ -54,243 +43,173 @@ if not MONGO_URI:
 # GEMINI CONNECTION
 # ============================================================
 
-@st.cache_resource
-def create_gemini_client():
+try:
 
-    try:
+    gemini_client = genai.Client(
+        api_key=GEMINI_API_KEY
+    )
 
-        client = genai.Client(
-            api_key=GEMINI_API_KEY
-        )
+except Exception as e:
 
-        return client
-
-    except Exception as e:
-
-        st.error(
-            f"Gemini connection failed: {e}"
-        )
-
-        return None
+    st.error(f"❌ Gemini initialization failed: {e}")
+    st.stop()
 
 
 # ============================================================
 # MONGODB CONNECTION
 # ============================================================
 
-@st.cache_resource
-def create_mongodb_connection():
+try:
 
-    try:
+    mongo_client = MongoClient(
+        MONGO_URI,
+        serverSelectionTimeoutMS=10000,
+        connectTimeoutMS=10000
+    )
 
-        client = MongoClient(
-            MONGO_URI,
-            serverSelectionTimeoutMS=10000,
-            connectTimeoutMS=10000
-        )
+    # Test MongoDB connection
+    mongo_client.admin.command("ping")
 
-        client.admin.command("ping")
+    db = mongo_client["chatbot"]
 
-        database = client["ai_chatbot"]
+    # Collection for complete conversations
+    chats_collection = db["chats"]
 
-        messages = database["messages"]
+    mongo_connected = True
 
-        return client, database, messages
+except Exception as e:
 
-    except Exception as e:
-
-        st.error(
-            f"MongoDB connection failed: {e}"
-        )
-
-        return None, None, None
-
-
-# ============================================================
-# CREATE CONNECTIONS
-# ============================================================
-
-gemini_client = create_gemini_client()
-
-mongo_client, db, messages_collection = (
-    create_mongodb_connection()
-)
-
-
-# ============================================================
-# CHECK CONNECTIONS
-# ============================================================
-
-if gemini_client is None:
-    st.stop()
-
-
-if messages_collection is None:
-    st.stop()
+    mongo_connected = False
+    mongo_error = str(e)
 
 
 # ============================================================
 # SESSION STATE
 # ============================================================
 
-if "conversation_id" not in st.session_state:
-
-    st.session_state.conversation_id = str(
-        uuid.uuid4()
-    )
-
-
 if "messages" not in st.session_state:
-
     st.session_state.messages = []
 
-
-if "loaded" not in st.session_state:
-
-    st.session_state.loaded = False
+if "chat_id" not in st.session_state:
+    st.session_state.chat_id = None
 
 
 # ============================================================
-# SAVE MESSAGE
+# FUNCTIONS
 # ============================================================
 
-def save_message(
-    conversation_id,
-    role,
-    content
-):
+def create_new_chat():
+    """
+    Start a completely new chat.
+    """
+
+    st.session_state.messages = []
+    st.session_state.chat_id = None
+
+
+def load_chat(chat_id):
+    """
+    Load a previous chat from MongoDB.
+    """
 
     try:
 
-        messages_collection.insert_one(
-            {
-                "conversation_id": conversation_id,
-                "role": role,
-                "content": content,
-                "created_at": datetime.now(
-                    timezone.utc
-                )
-            }
+        chat = chats_collection.find_one(
+            {"_id": ObjectId(chat_id)}
         )
 
-        return True
+        if chat:
+
+            st.session_state.chat_id = chat_id
+
+            st.session_state.messages = chat.get(
+                "messages",
+                []
+            )
 
     except Exception as e:
 
-        st.error(
-            f"Could not save message: {e}"
-        )
-
-        return False
+        st.error(f"❌ Could not load chat: {e}")
 
 
-# ============================================================
-# LOAD CHAT HISTORY
-# ============================================================
+def save_chat():
 
-def load_messages(
-    conversation_id
-):
+    if not mongo_connected:
+        return
+
+    if not st.session_state.messages:
+        return
 
     try:
 
-        cursor = messages_collection.find(
-            {
-                "conversation_id": conversation_id
-            }
-        ).sort(
-            "created_at",
-            1
+        now = datetime.now(timezone.utc)
+
+        # Create title from first user message
+        first_user_message = next(
+            (
+                message["content"]
+                for message in st.session_state.messages
+                if message["role"] == "user"
+            ),
+            "New Chat"
         )
 
-        messages = []
+        title = first_user_message[:40]
 
-        for document in cursor:
+        # Existing chat
+        if st.session_state.chat_id:
 
-            messages.append(
+            chats_collection.update_one(
                 {
-                    "role": document["role"],
-                    "content": document["content"]
+                    "_id": ObjectId(
+                        st.session_state.chat_id
+                    )
+                },
+                {
+                    "$set": {
+                        "messages": st.session_state.messages,
+                        "title": title,
+                        "updated_at": now
+                    }
                 }
             )
 
-        return messages
+        # New chat
+        else:
+
+            result = chats_collection.insert_one(
+                {
+                    "title": title,
+                    "messages": st.session_state.messages,
+                    "created_at": now,
+                    "updated_at": now
+                }
+            )
+
+            st.session_state.chat_id = str(
+                result.inserted_id
+            )
 
     except Exception as e:
 
-        st.error(
-            f"Could not load chat history: {e}"
-        )
-
-        return []
+        st.error(f"❌ Could not save chat: {e}")
 
 
-# ============================================================
-# DELETE CHAT
-# ============================================================
+def delete_all_chats():
 
-def delete_chat(
-    conversation_id
-):
+    if not mongo_connected:
+        return
 
     try:
 
-        messages_collection.delete_many(
-            {
-                "conversation_id": conversation_id
-            }
-        )
+        chats_collection.delete_many({})
 
-        return True
+        st.session_state.messages = []
+        st.session_state.chat_id = None
 
     except Exception as e:
 
-        st.error(
-            f"Could not delete chat: {e}"
-        )
-
-        return False
-
-
-# ============================================================
-# ASK GEMINI
-# ============================================================
-
-def ask_gemini(
-    question
-):
-
-    try:
-
-        response = gemini_client.models.generate_content(
-
-            model="gemini-2.5-flash",
-
-            contents=question
-        )
-
-        if response.text:
-
-            return response.text
-
-        return "Gemini returned an empty response."
-
-    except Exception as e:
-
-        return f"ERROR: {e}"
-
-
-# ============================================================
-# LOAD DATABASE CHAT HISTORY
-# ============================================================
-
-if not st.session_state.loaded:
-
-    st.session_state.messages = load_messages(
-        st.session_state.conversation_id
-    )
-
-    st.session_state.loaded = True
+        st.error(f"❌ Could not clear chats: {e}")
 
 
 # ============================================================
@@ -299,120 +218,124 @@ if not st.session_state.loaded:
 
 with st.sidebar:
 
-    st.title("⚙️ Chat Settings")
+    st.title("⚙️ Settings")
+
+    # MongoDB status
+    if mongo_connected:
+
+        st.success("🟢 MongoDB Connected")
+
+    else:
+
+        st.error("🔴 MongoDB Failed")
+
+        with st.expander("MongoDB Error"):
+            st.code(mongo_error)
 
     st.divider()
-
-    # --------------------------------------------------------
-    # DATABASE STATUS
-    # --------------------------------------------------------
-
-    st.subheader("Database")
-
-    st.success("🟢 MongoDB Connected")
-
-
-    # --------------------------------------------------------
-    # GEMINI STATUS
-    # --------------------------------------------------------
-
-    st.subheader("AI Model")
-
-    st.success("🟢 Gemini Connected")
-
-
-    st.divider()
-
-
-    # --------------------------------------------------------
-    # STATISTICS
-    # --------------------------------------------------------
-
-    st.subheader("📊 Chat Statistics")
-
-    total_messages = len(
-        st.session_state.messages
-    )
-
-    user_messages = sum(
-        1
-        for message in st.session_state.messages
-        if message["role"] == "user"
-    )
-
-    ai_messages = sum(
-        1
-        for message in st.session_state.messages
-        if message["role"] == "assistant"
-    )
-
-    st.write(
-        f"Total messages: **{total_messages}**"
-    )
-
-    st.write(
-        f"Your questions: **{user_messages}**"
-    )
-
-    st.write(
-        f"AI answers: **{ai_messages}**"
-    )
-
-
-    st.divider()
-
 
     # --------------------------------------------------------
     # NEW CHAT
     # --------------------------------------------------------
 
     if st.button(
-        "➕ New Chat",
+        "🆕 New Chat",
         use_container_width=True
     ):
 
-        st.session_state.conversation_id = str(
-            uuid.uuid4()
-        )
-
-        st.session_state.messages = []
-
-        st.session_state.loaded = True
-
+        create_new_chat()
         st.rerun()
 
-
     # --------------------------------------------------------
-    # CLEAR CHAT
+    # CLEAR ALL CHAT HISTORY
     # --------------------------------------------------------
 
     if st.button(
-        "🗑️ Clear Current Chat",
+        "🗑️ Clear Chat History",
         use_container_width=True
     ):
 
-        delete_chat(
-            st.session_state.conversation_id
-        )
-
-        st.session_state.messages = []
-
+        delete_all_chats()
         st.rerun()
 
+    st.divider()
+
+    # --------------------------------------------------------
+    # CHAT HISTORY
+    # --------------------------------------------------------
+
+    st.subheader("💬 Chat History")
+
+    if mongo_connected:
+
+        chats = list(
+            chats_collection.find(
+                {},
+                {
+                    "title": 1,
+                    "updated_at": 1
+                }
+            ).sort(
+                "updated_at",
+                -1
+            )
+        )
+
+        if not chats:
+
+            st.caption(
+                "No previous chats"
+            )
+
+        else:
+
+            for chat in chats:
+
+                chat_id = str(
+                    chat["_id"]
+                )
+
+                title = chat.get(
+                    "title",
+                    "New Chat"
+                )
+
+                # Limit title length
+                if len(title) > 35:
+                    title = title[:35] + "..."
+
+                # Highlight current chat
+                if chat_id == st.session_state.chat_id:
+
+                    button_text = f"🟢 {title}"
+
+                else:
+
+                    button_text = f"💬 {title}"
+
+                if st.button(
+                    button_text,
+                    key=f"chat_{chat_id}",
+                    use_container_width=True
+                ):
+
+                    load_chat(chat_id)
+                    st.rerun()
+
 
 # ============================================================
-# MAIN PAGE
+# MAIN CHAT AREA
 # ============================================================
 
-st.title("🤖 Gemini AI Chatbot")
+st.title("🤖 AI Chatbot")
 
 st.caption(
-    "Streamlit + Gemini API + MongoDB Atlas + Render"
+    "Google Gemini + Streamlit + MongoDB Atlas"
 )
 
 
 # ============================================================
-# DISPLAY CHAT HISTORY
+# DISPLAY CHAT MESSAGES
 # ============================================================
 
 for message in st.session_state.messages:
@@ -430,98 +353,76 @@ for message in st.session_state.messages:
 # CHAT INPUT
 # ============================================================
 
-user_input = st.chat_input(
-    "Ask Gemini something..."
+prompt = st.chat_input(
+    "Ask me anything..."
 )
 
 
-# ============================================================
-# PROCESS USER QUESTION
-# ============================================================
-
-if user_input:
+if prompt:
 
     # --------------------------------------------------------
-    # DISPLAY USER MESSAGE
-    # --------------------------------------------------------
-
-    with st.chat_message("user"):
-
-        st.markdown(
-            user_input
-        )
-
-
-    # --------------------------------------------------------
-    # ADD USER MESSAGE TO SESSION
+    # USER MESSAGE
     # --------------------------------------------------------
 
     st.session_state.messages.append(
         {
             "role": "user",
-            "content": user_input
+            "content": prompt
         }
     )
 
+    with st.chat_message("user"):
 
-    # --------------------------------------------------------
-    # SAVE USER MESSAGE TO MONGODB
-    # --------------------------------------------------------
-
-    save_message(
-        st.session_state.conversation_id,
-        "user",
-        user_input
-    )
+        st.markdown(prompt)
 
 
     # --------------------------------------------------------
-    # ASK GEMINI
+    # GEMINI RESPONSE
     # --------------------------------------------------------
 
     with st.chat_message("assistant"):
 
-        with st.spinner(
-            "Gemini is thinking..."
-        ):
+        with st.spinner("Thinking..."):
 
-            answer = ask_gemini(
-                user_input
-            )
+            try:
 
+                # Create conversation text
+                conversation = []
 
-        # ----------------------------------------------------
-        # CHECK GEMINI ERROR
-        # ----------------------------------------------------
+                for message in st.session_state.messages:
 
-        if answer.startswith("ERROR:"):
+                    conversation.append(
+                        f"{message['role']}: "
+                        f"{message['content']}"
+                    )
 
-            st.error(
-                answer
-            )
+                conversation_text = "\n".join(
+                    conversation
+                )
 
-        else:
+                # Gemini
+                response = gemini_client.models.generate_content(
+                    model="gemini-3.6-flash",
+                    contents=conversation_text
+                )
 
-            st.markdown(
-                answer
-            )
+                answer = response.text
 
+                st.markdown(answer)
 
-    # --------------------------------------------------------
-    # SAVE AI RESPONSE
-    # --------------------------------------------------------
+                # Save assistant message
+                st.session_state.messages.append(
+                    {
+                        "role": "assistant",
+                        "content": answer
+                    }
+                )
 
-    if not answer.startswith("ERROR:"):
+                # Save entire conversation
+                save_chat()
 
-        st.session_state.messages.append(
-            {
-                "role": "assistant",
-                "content": answer
-            }
-        )
+            except Exception as e:
 
-        save_message(
-            st.session_state.conversation_id,
-            "assistant",
-            answer
-        )
+                st.error(
+                    f"❌ Gemini error: {e}"
+                )
