@@ -1,201 +1,164 @@
-import os
-import requests
 import streamlit as st
+from google import genai
+from pymongo import MongoClient
+from datetime import datetime, timezone
+import uuid
 
 
 # ============================================================
-# PAGE CONFIGURATION
+# PAGE CONFIG
 # ============================================================
 
 st.set_page_config(
-    page_title="AI Chatbot",
+    page_title="Gemini AI Chatbot",
     page_icon="🤖",
-    layout="wide",
-    initial_sidebar_state="expanded",
+    layout="wide"
 )
 
 
 # ============================================================
-# CONFIGURATION
+# GEMINI CONNECTION
 # ============================================================
 
-OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+@st.cache_resource
+def get_gemini_client():
 
-MODELS = {
-    "Gemini 2.5 Flash": "google/gemini-2.5-flash",
-    "Llama 3.3 70B": "meta-llama/llama-3.3-70b-instruct",
-    "Phi-4": "microsoft/phi-4",
-}
+    api_key = st.secrets["GEMINI_API_KEY"]
 
-SYSTEM_PROMPT = """
-You are a helpful, friendly, and accurate AI assistant.
+    client = genai.Client(
+        api_key=api_key
+    )
 
-Give clear answers that are easy to understand.
-If you are unsure about something, say so instead of making up information.
-Use markdown when it improves readability.
-"""
+    return client
 
 
 # ============================================================
-# CUSTOM CSS
+# MONGODB CONNECTION
 # ============================================================
 
-st.markdown(
-    """
-    <style>
-        .main-title {
-            font-size: 2.3rem;
-            font-weight: 700;
-            margin-bottom: 0.2rem;
-        }
+@st.cache_resource
+def get_mongodb():
 
-        .subtitle {
-            color: #777;
-            margin-bottom: 1.5rem;
-        }
+    mongo_uri = st.secrets["MONGO_URI"]
 
-        .model-info {
-            padding: 10px;
-            border-radius: 8px;
-            background-color: rgba(128, 128, 128, 0.1);
-            margin-bottom: 15px;
-        }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
+    client = MongoClient(
+        mongo_uri
+    )
+
+    # Test MongoDB connection
+    client.admin.command("ping")
+
+    database = client["ai_chatbot"]
+
+    return database
+
+
+# ============================================================
+# CONNECT
+# ============================================================
+
+try:
+
+    gemini_client = get_gemini_client()
+
+    db = get_mongodb()
+
+    messages_collection = db["messages"]
+
+    connection_status = True
+
+except Exception as e:
+
+    connection_status = False
+
+    st.error(
+        f"Database/API connection error: {e}"
+    )
 
 
 # ============================================================
 # SESSION STATE
 # ============================================================
 
+if "conversation_id" not in st.session_state:
+
+    st.session_state.conversation_id = str(
+        uuid.uuid4()
+    )
+
+
 if "messages" not in st.session_state:
+
     st.session_state.messages = []
 
-if "total_requests" not in st.session_state:
-    st.session_state.total_requests = 0
-
-if "selected_model" not in st.session_state:
-    st.session_state.selected_model = "Gemini 2.5 Flash"
-
 
 # ============================================================
-# API KEY
+# SAVE MESSAGE TO MONGODB
 # ============================================================
 
-def get_api_key():
-    """
-    Get OpenRouter API key.
+def save_message(
+    conversation_id,
+    role,
+    message
+):
 
-    Priority:
-    1. Streamlit secrets
-    2. Environment variable
-    """
-
-    # Streamlit Cloud / .streamlit/secrets.toml
-    try:
-        if "OPENROUTER_API_KEY" in st.secrets:
-            return st.secrets["OPENROUTER_API_KEY"]
-    except Exception:
-        pass
-
-    # Environment variable
-    api_key = os.getenv("OPENROUTER_API_KEY")
-
-    return api_key
-
-
-# ============================================================
-# OPENROUTER API CALL
-# ============================================================
-
-def get_ai_response(messages, model_name, api_key):
-    """
-    Send chat history to OpenRouter and return AI response.
-    """
-
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-        "HTTP-Referer": "https://streamlit.io",
-        "X-Title": "Simple AI Chatbot",
-    }
-
-    # Add system message before conversation history
-    api_messages = [
+    messages_collection.insert_one(
         {
-            "role": "system",
-            "content": SYSTEM_PROMPT,
-        }
-    ]
-
-    # Send recent conversation history
-    api_messages.extend(messages[-20:])
-
-    payload = {
-        "model": model_name,
-        "messages": api_messages,
-        "temperature": 0.7,
-        "max_tokens": 1000,
-    }
-
-    try:
-        response = requests.post(
-            OPENROUTER_URL,
-            headers=headers,
-            json=payload,
-            timeout=60,
-        )
-
-        # Handle HTTP errors
-        if response.status_code != 200:
-
-            try:
-                error_data = response.json()
-                error_message = error_data.get("error", {}).get(
-                    "message",
-                    "Unknown API error"
-                )
-            except Exception:
-                error_message = response.text
-
-            return None, (
-                f"OpenRouter API error "
-                f"({response.status_code}): {error_message}"
+            "conversation_id": conversation_id,
+            "role": role,
+            "message": message,
+            "created_at": datetime.now(
+                timezone.utc
             )
+        }
+    )
 
-        data = response.json()
 
-        # Validate response
-        if "choices" not in data or not data["choices"]:
-            return None, "The API returned an empty response."
+# ============================================================
+# LOAD CHAT HISTORY
+# ============================================================
 
-        message = data["choices"][0].get("message", {})
-        content = message.get("content")
+def load_messages(
+    conversation_id
+):
 
-        if not content:
-            return None, "The AI returned an empty message."
+    messages = []
 
-        return content, None
+    cursor = messages_collection.find(
+        {
+            "conversation_id": conversation_id
+        }
+    ).sort(
+        "created_at",
+        1
+    )
 
-    except requests.exceptions.Timeout:
-        return None, (
-            "The request timed out. "
-            "Please try again."
+    for document in cursor:
+
+        messages.append(
+            {
+                "role": document["role"],
+                "content": document["message"]
+            }
         )
 
-    except requests.exceptions.ConnectionError:
-        return None, (
-            "Could not connect to OpenRouter. "
-            "Please check your internet connection."
-        )
+    return messages
 
-    except requests.exceptions.RequestException as e:
-        return None, f"Network error: {str(e)}"
 
-    except Exception as e:
-        return None, f"Unexpected error: {str(e)}"
+# ============================================================
+# GEMINI RESPONSE
+# ============================================================
+
+def ask_gemini(question):
+
+    response = gemini_client.models.generate_content(
+
+        model="gemini-2.5-flash",
+
+        contents=question
+    )
+
+    return response.text
 
 
 # ============================================================
@@ -204,131 +167,114 @@ def get_ai_response(messages, model_name, api_key):
 
 with st.sidebar:
 
-    st.header("⚙️ Settings")
+    st.title("⚙️ Settings")
 
-    selected_model = st.selectbox(
-        "Choose AI Model",
-        options=list(MODELS.keys()),
-        index=list(MODELS.keys()).index(
-            st.session_state.selected_model
-        ),
-    )
+    st.write("### Database")
 
-    st.session_state.selected_model = selected_model
+    if connection_status:
 
-    model_id = MODELS[selected_model]
+        st.success(
+            "MongoDB Connected"
+        )
 
-    st.markdown(
-        f"""
-        <div class="model-info">
-            <b>Selected Model</b><br>
-            {selected_model}<br><br>
-            <small>{model_id}</small>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+    else:
+
+        st.error(
+            "MongoDB Not Connected"
+        )
 
     st.divider()
 
-    st.subheader("📊 Chat Statistics")
+    st.write("### Chat Statistics")
 
-    total_messages = len(st.session_state.messages)
-    user_messages = sum(
+    st.write(
+        f"Messages: {len(st.session_state.messages)}"
+    )
+
+    user_count = sum(
         1
         for message in st.session_state.messages
         if message["role"] == "user"
     )
-    assistant_messages = sum(
+
+    assistant_count = sum(
         1
         for message in st.session_state.messages
         if message["role"] == "assistant"
     )
 
-    col1, col2 = st.columns(2)
+    st.write(
+        f"Your Questions: {user_count}"
+    )
 
-    with col1:
-        st.metric("Messages", total_messages)
-
-    with col2:
-        st.metric("Requests", st.session_state.total_requests)
-
-    st.metric("Your Questions", user_messages)
-    st.metric("AI Answers", assistant_messages)
+    st.write(
+        f"AI Answers: {assistant_count}"
+    )
 
     st.divider()
 
+    # New chat
     if st.button(
-        "🗑️ Clear Chat",
-        use_container_width=True,
+        "➕ New Chat",
+        use_container_width=True
     ):
+
+        st.session_state.conversation_id = str(
+            uuid.uuid4()
+        )
+
         st.session_state.messages = []
-        st.session_state.total_requests = 0
+
         st.rerun()
 
-    st.divider()
+    # Clear current chat
+    if st.button(
+        "🗑️ Clear Chat",
+        use_container_width=True
+    ):
 
-    st.caption(
-        "Powered by Streamlit + OpenRouter"
-    )
+        messages_collection.delete_many(
+            {
+                "conversation_id":
+                st.session_state.conversation_id
+            }
+        )
+
+        st.session_state.messages = []
+
+        st.rerun()
 
 
 # ============================================================
-# MAIN UI
+# MAIN PAGE
 # ============================================================
 
-st.markdown(
-    '<div class="main-title">🤖 AI Chatbot</div>',
-    unsafe_allow_html=True,
+st.title("🤖 Gemini AI Chatbot")
+
+st.write(
+    "Simple Streamlit chatbot with Gemini API and MongoDB."
 )
 
-st.markdown(
-    '<div class="subtitle">'
-    "Chat with Gemini, Llama, or Phi using OpenRouter."
-    "</div>",
-    unsafe_allow_html=True,
-)
-
 
 # ============================================================
-# API KEY CHECK
+# LOAD EXISTING CHAT FROM DATABASE
 # ============================================================
 
-api_key = get_api_key()
+if len(st.session_state.messages) == 0:
 
-if not api_key:
+    try:
 
-    st.warning(
-        "⚠️ OpenRouter API key is not configured."
-    )
+        database_messages = load_messages(
+            st.session_state.conversation_id
+        )
 
-    st.info(
-        """
-        ### How to configure the API key
+        st.session_state.messages = database_messages
 
-        **For Streamlit Cloud:**
+    except Exception as e:
 
-        Add this to your app's Secrets:
-
-        ```toml
-        OPENROUTER_API_KEY = "your-api-key-here"
-        ```
-
-        **For local testing:**
-
-        Create:
-
-        `.streamlit/secrets.toml`
-
-        and add:
-
-        ```toml
-        OPENROUTER_API_KEY = "your-api-key-here"
-        ```
-        """
-    )
-
-    st.stop()
+        st.error(
+            f"Could not load chat history: {e}"
+        )
 
 
 # ============================================================
@@ -337,8 +283,13 @@ if not api_key:
 
 for message in st.session_state.messages:
 
-    with st.chat_message(message["role"]):
-        st.markdown(message["content"])
+    with st.chat_message(
+        message["role"]
+    ):
+
+        st.markdown(
+            message["content"]
+        )
 
 
 # ============================================================
@@ -346,63 +297,110 @@ for message in st.session_state.messages:
 # ============================================================
 
 user_input = st.chat_input(
-    "Type your message here..."
+    "Ask Gemini something..."
 )
 
+
+# ============================================================
+# PROCESS USER MESSAGE
+# ============================================================
 
 if user_input:
 
     # --------------------------------------------------------
-    # Add user message
+    # Display user message
+    # --------------------------------------------------------
+
+    with st.chat_message("user"):
+
+        st.markdown(
+            user_input
+        )
+
+
+    # --------------------------------------------------------
+    # Add to session
     # --------------------------------------------------------
 
     st.session_state.messages.append(
         {
             "role": "user",
-            "content": user_input,
+            "content": user_input
         }
     )
 
-    with st.chat_message("user"):
-        st.markdown(user_input)
 
     # --------------------------------------------------------
-    # Generate AI response
+    # Save user message to MongoDB
+    # --------------------------------------------------------
+
+    try:
+
+        save_message(
+            st.session_state.conversation_id,
+            "user",
+            user_input
+        )
+
+    except Exception as e:
+
+        st.error(
+            f"Could not save user message: {e}"
+        )
+
+
+    # --------------------------------------------------------
+    # Ask Gemini
     # --------------------------------------------------------
 
     with st.chat_message("assistant"):
 
         with st.spinner(
-            f"{selected_model} is thinking..."
+            "Gemini is thinking..."
         ):
 
-            response, error = get_ai_response(
-                st.session_state.messages,
-                model_id,
-                api_key,
+            try:
+
+                answer = ask_gemini(
+                    user_input
+                )
+
+                st.markdown(
+                    answer
+                )
+
+            except Exception as e:
+
+                answer = None
+
+                st.error(
+                    f"Gemini error: {e}"
+                )
+
+
+    # --------------------------------------------------------
+    # Save Gemini response
+    # --------------------------------------------------------
+
+    if answer:
+
+        st.session_state.messages.append(
+            {
+                "role": "assistant",
+                "content": answer
+            }
+        )
+
+        try:
+
+            save_message(
+                st.session_state.conversation_id,
+                "assistant",
+                answer
             )
 
-        # ----------------------------------------------------
-        # Handle error
-        # ----------------------------------------------------
+        except Exception as e:
 
-        if error:
-
-            st.error(error)
-
-            # Remove user message if request failed
-            st.session_state.messages.pop()
-
-        else:
-
-            st.markdown(response)
-
-            # Save assistant response
-            st.session_state.messages.append(
-                {
-                    "role": "assistant",
-                    "content": response,
-                }
+            st.error(
+                f"Could not save AI response: {e}"
             )
-
-            st.session_state.total_requests += 1

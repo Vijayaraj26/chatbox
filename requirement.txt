@@ -1,2 +1,6 @@
+streamlit>=1.45,<2
+requests>=2.31,<3
+pymongo>=4.10,<5
 streamlit
 requests
+pymongo
