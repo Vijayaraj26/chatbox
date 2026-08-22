@@ -1,20 +1,15 @@
 import streamlit as st
-from google import genai
 
-st.title("Gemini Test")
+st.title("Package Test")
 
 try:
-    client = genai.Client(
-        api_key=st.secrets["GEMINI_API_KEY"]
-    )
+    import google.genai
 
-    response = client.models.generate_content(
-        model="gemini-2.5-flash",
-        contents="Say hello in one sentence."
-    )
+    st.success("google-genai is installed")
 
-    st.success("Gemini connection works!")
-    st.write(response.text)
+    from google import genai
+
+    st.success("Gemini import works!")
 
 except Exception as e:
-    st.error(f"Error: {e}")
+    st.error(f"Gemini import failed: {type(e).__name__}: {e}")
