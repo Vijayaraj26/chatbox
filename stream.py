@@ -85,10 +85,10 @@ def create_mongodb_connection():
 
         client = MongoClient(
             MONGO_URI,
-            serverSelectionTimeoutMS=5000
+            serverSelectionTimeoutMS=10000,
+            connectTimeoutMS=10000
         )
 
-        # Test connection
         client.admin.command("ping")
 
         database = client["ai_chatbot"]
